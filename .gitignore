@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# Build artifacts
+.build/
+*.app
+*.zip
+
+# Local configurations
+.DesktopPet/
+config.json
+
+# Swift Package Manager
+.build/
+Package.resolved
