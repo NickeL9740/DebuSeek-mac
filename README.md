@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <img src="BV1ypb56REM7.gif" width="400" alt="DebuSeek Demo" />
+  <img src="BV1ypb56REM7.gif" width="200" alt="DebuSeek fan-made art" />
 </p>
 
 **[简体中文](#简体中文) | [English](#english)**
