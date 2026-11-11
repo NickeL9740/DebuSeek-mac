@@ -6,6 +6,7 @@ import SwiftUI
 enum PetActivity: String {
     case idle
     case walk
+    case jump
     case sleep
     case eat
     case explore
@@ -20,7 +21,7 @@ class PetState: ObservableObject {
     
     @Published var happiness: Int = 100
     @Published var hunger: Int = 0
-    var energy: Int = 100
+    @Published var energy: Int = 100
     @Published var isSleeping: Bool = false
     @Published var currentAnimation: String = "IDLE"
     @Published var position: CGPoint = CGPoint(x: 100, y: 100)
@@ -59,6 +60,7 @@ class PetState: ObservableObject {
                 energy = state.energy
                 isSleeping = state.isSleeping
                 position = CGPoint(x: state.positionX, y: state.positionY)
+                lastInteraction = state.lastInteraction ?? Date()
                 print("✅ Pet state loaded")
             } catch {
                 print("❌ Failed to load pet state: \(error)")
@@ -76,7 +78,8 @@ class PetState: ObservableObject {
             energy: energy,
             isSleeping: isSleeping,
             positionX: position.x,
-            positionY: position.y
+            positionY: position.y,
+            lastInteraction: lastInteraction
         )
         do {
             let encoded = try encoder.encode(data)
@@ -98,6 +101,7 @@ class PetState: ObservableObject {
         currentActivity = .idle
         isAngry = false
         consecutivePokes = 0
+        lastInteraction = Date()
         saveState()
     }
     
@@ -114,6 +118,9 @@ class PetState: ObservableObject {
     func updateEnergy(_ delta: Int) {
         energy = max(0, min(100, energy + delta))
         saveState()
+        if energy == 0 {
+            NotificationCenter.default.post(name: NSNotification.Name("PetEnergyDepleted"), object: nil)
+        }
     }
     
     func setAnimation(_ animation: String) {
@@ -135,6 +142,9 @@ class PetState: ObservableObject {
         lastInteraction = Date()
     }
     
+    /// 精力归零即昏厥：鼠标/聊天都会被拦截，只能睡觉恢复。
+    var isFainted: Bool { energy <= 0 }
+
     var mood: PetMood {
         if isSleeping { return .sleeping }
         if happiness > 70 { return .happy }
@@ -155,6 +165,8 @@ struct PetStateData: Codable {
     var isSleeping: Bool
     var positionX: Double
     var positionY: Double
+    /// 旧 pet_state.json 没有这个字段；用可选值保证兼容。
+    var lastInteraction: Date?
 }
 
 enum PetMood {
@@ -205,6 +217,8 @@ enum MessageRole: String, Codable {
     case user = "user"
     case assistant = "assistant"
     case system = "system"
+    /// 仅用于 UI 的“上下文已压缩”分隔标记，不发送给 API。
+    case systemNote = "system_note"
 }
 
 @MainActor
@@ -265,6 +279,74 @@ class ChatHistoryManager: ObservableObject {
     func clearHistory() {
         messages.removeAll()
         saveHistory()
+    }
+
+    /// 只删除摘要快照里的旧消息，保留摘要期间新产生的对话。
+    func removeOldest(_ count: Int) {
+        guard count > 0, !messages.isEmpty else { return }
+        messages.removeFirst(min(count, messages.count))
+        saveHistory()
+    }
+
+    /// 最近一次“已压缩”分隔标记之后的对话；没有标记时返回全部历史。
+    /// 自动压缩阈值和下一次摘要都只看这一段，避免不删历史后每轮重复压缩。
+    func messagesSinceLastSummary() -> [ChatMessage] {
+        let start: Int
+        if let lastNote = messages.lastIndex(where: { $0.role == .systemNote }) {
+            start = messages.index(after: lastNote)
+        } else {
+            start = messages.startIndex
+        }
+        guard start < messages.endIndex else { return [] }
+        return messages[start...].filter { $0.role != .systemNote }
+    }
+
+    // MARK: - Export
+
+    func exportHistoryJSON(to url: URL) throws {
+        let exportEncoder = JSONEncoder()
+        exportEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        exportEncoder.dateEncodingStrategy = .iso8601
+        let data = try exportEncoder.encode(messages)
+        try data.write(to: url, options: .atomic)
+    }
+
+    func exportHistoryTXT(to url: URL) throws {
+        let dayFormatter = DateFormatter()
+        dayFormatter.locale = Locale(identifier: "en_US_POSIX")
+        dayFormatter.dateFormat = "yyyy-MM-dd"
+
+        let timeFormatter = DateFormatter()
+        timeFormatter.locale = Locale(identifier: "en_US_POSIX")
+        timeFormatter.dateFormat = "HH:mm"
+
+        let petName = ConfigManager.shared.config.pet.name
+        var lines: [String] = []
+        var currentDay: String?
+
+        for message in messages {
+            let day = dayFormatter.string(from: message.timestamp)
+            if day != currentDay {
+                if currentDay != nil { lines.append("") }
+                lines.append("[\(day)]")
+                currentDay = day
+            }
+
+            let time = timeFormatter.string(from: message.timestamp)
+            switch message.role {
+            case .user:
+                lines.append("[\(time)] 用户: \(message.content)")
+            case .assistant:
+                lines.append("[\(time)] \(petName): \(message.content)")
+            case .system:
+                lines.append("[\(time)] 系统: \(message.content)")
+            case .systemNote:
+                lines.append("[\(time)] \(message.content)")
+            }
+        }
+
+        let text = lines.joined(separator: "\n") + (lines.isEmpty ? "" : "\n")
+        try text.write(to: url, atomically: true, encoding: .utf8)
     }
     
     func getRecentMessages(limit: Int = 10) -> [ChatMessage] {

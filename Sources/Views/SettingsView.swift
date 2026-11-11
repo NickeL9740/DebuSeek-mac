@@ -1,5 +1,7 @@
 import SwiftUI
 import AppKit
+import ServiceManagement
+import UniformTypeIdentifiers
 
 // MARK: - Settings View
 
@@ -40,6 +42,10 @@ struct SettingsView: View {
             AdvancedSettingsView()
                 .tabItem { Label("高级", systemImage: "slider.horizontal.3") }
                 .tag(SettingsTab.advanced)
+
+            DebugSettingsView()
+                .tabItem { Label("调试", systemImage: "ladybug") }
+                .tag(SettingsTab.debug)
         }
         .frame(minWidth: 550, minHeight: 600)
         .padding()
@@ -54,6 +60,7 @@ enum SettingsTab: String, CaseIterable {
     case behavior = "behavior"
     case interaction = "interaction"
     case advanced = "advanced"
+    case debug = "debug"
 }
 
 // MARK: - General Settings
@@ -125,6 +132,8 @@ struct GeneralSettingsView: View {
             Section("数据管理") {
                 Button("导出配置") { exportConfig() }
                 Button("导入配置") { importConfig() }
+                Button("导出聊天记录（JSON）") { exportChatJSON() }
+                Button("导出聊天记录（TXT）") { exportChatTXT() }
                 Button("重置为默认") { configManager.resetToDefault() }
                     .foregroundColor(.red)
                 Button("清空聊天记录") { ChatHistoryManager.shared.clearHistory() }
@@ -135,12 +144,19 @@ struct GeneralSettingsView: View {
     }
     
     private func isLoginItemEnabled() -> Bool {
-        // Check if app is in login items
-        false
+        SMAppService.mainApp.status == .enabled
     }
     
     private func setLoginItem(enabled: Bool) {
-        // Set login item
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+        } catch {
+            NSLog("❌ Failed to update login item: \(error)")
+        }
     }
     
     private func exportConfig() {
@@ -163,6 +179,41 @@ struct GeneralSettingsView: View {
                 try? configManager.importConfig(from: url)
             }
         }
+    }
+
+    private func exportChatJSON() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "DebuSeek_Chat_\(fileTimestamp()).json"
+        panel.allowedContentTypes = [.json]
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                try ChatHistoryManager.shared.exportHistoryJSON(to: url)
+            } catch {
+                NSLog("❌ Failed to export chat JSON: \(error)")
+            }
+        }
+    }
+
+    private func exportChatTXT() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "DebuSeek_Chat_\(fileTimestamp()).txt"
+        panel.allowedContentTypes = [.plainText]
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                try ChatHistoryManager.shared.exportHistoryTXT(to: url)
+            } catch {
+                NSLog("❌ Failed to export chat TXT: \(error)")
+            }
+        }
+    }
+
+    private func fileTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd_HHmm"
+        return formatter.string(from: Date())
     }
 }
 
@@ -442,6 +493,7 @@ struct TTSView: View {
     /// 音量/语速直接绑定 TTSServiceManager；进入页面时同步一次当前值
     @State private var ttsVolume: Double = 0.3
     @State private var ttsSpeed: Double = 1.0
+    @State private var cacheCleanMessage: String = ""
     
     var body: some View {
         Form {
@@ -568,7 +620,26 @@ struct TTSView: View {
                     }
                 }
             }
-            
+
+            Section("本地语音缓存") {
+                Button("清理本地语音缓存") {
+                    let removed = LocalGptSovitsService.clearCache()
+                    cacheCleanMessage = removed > 0
+                        ? "已清理 \(removed) 个缓存文件"
+                        : "缓存已经是空的"
+                }
+
+                if !cacheCleanMessage.isEmpty {
+                    Text(cacheCleanMessage)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                Text("缓存目录：~/Library/Application Support/DebuSeek/Cache/。\n仅对 GPT-SoVITS 本地语音生效，相同的文本/参考音频/参数会直接复用。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
             Section("测试") {
                 Button("测试语音") {
                     PetController.shared.speak("你好呀！我是大肥鱼~")
@@ -588,6 +659,8 @@ struct TTSView: View {
 
 struct ChatSettingsView: View {
     @EnvironmentObject var configManager: ConfigManager
+    @ObservedObject private var usage = UsageManager.shared
+    @ObservedObject private var chatService = ChatServiceManager.shared
     
     var body: some View {
         Form {
@@ -604,6 +677,83 @@ struct ChatSettingsView: View {
                     Text("OpenAI 兼容 API").tag(ChatProvider.deepseek)
                     Text("本地 LLM (Ollama)").tag(ChatProvider.localLlm)
                 }
+
+                TextField("用户昵称", text: Binding(
+                    get: { configManager.config.chat.userNickname },
+                    set: { newValue in configManager.updateChatConfig { $0.userNickname = newValue } }
+                ), prompt: Text("例如：老板 / 小 nick（留空则不注入）"))
+                Text("会追加到 system prompt 末尾，让宠物用这个称呼叫你。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Section("长期记忆") {
+                Toggle("启用长期记忆", isOn: Binding(
+                    get: { configManager.config.chat.enableMemorySummarization },
+                    set: { newValue in configManager.updateChatConfig { $0.enableMemorySummarization = newValue } }
+                ))
+
+                Toggle("自动压缩历史", isOn: Binding(
+                    get: { configManager.config.chat.enableAutoSummarize },
+                    set: { newValue in configManager.updateChatConfig { $0.enableAutoSummarize = newValue } }
+                ))
+                .disabled(!configManager.config.chat.enableMemorySummarization)
+
+                Stepper("每 \(configManager.config.chat.autoSummarizeRounds) 轮压缩", value: Binding(
+                    get: { configManager.config.chat.autoSummarizeRounds },
+                    set: { newValue in configManager.updateChatConfig { $0.autoSummarizeRounds = max(1, newValue) } }
+                ), in: 1...50)
+                .disabled(!configManager.config.chat.enableMemorySummarization || !configManager.config.chat.enableAutoSummarize)
+
+                Button("立即压缩历史") {
+                    PetController.shared.summarizeAndClearHistory()
+                }
+                .disabled(!configManager.config.chat.enabled || !configManager.config.chat.enableMemorySummarization || chatService.isProcessing)
+
+                Text("回忆录（可编辑，压缩后会更新；也可手动修正模型记错的内容）")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                TextEditor(text: Binding(
+                    get: { configManager.config.chat.memorySummary },
+                    set: { newValue in configManager.updateChatConfig { $0.memorySummary = newValue } }
+                ))
+                .frame(height: 110)
+                .border(Color.gray.opacity(0.3))
+
+                Text("摘要 Prompt（可选，支持 {transcript} 占位符；留空使用内置提示词）")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                TextEditor(text: Binding(
+                    get: { configManager.config.chat.customSummaryPrompt },
+                    set: { newValue in configManager.updateChatConfig { $0.customSummaryPrompt = newValue } }
+                ))
+                .frame(height: 80)
+                .border(Color.gray.opacity(0.3))
+
+                Text("回忆录 \(configManager.config.chat.memorySummary.count) 字；达到 \(max(2, configManager.config.chat.autoSummarizeRounds * 2)) 条历史后后台静默压缩。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Section("Token 感知") {
+                Toggle("注入 Token 消耗提示", isOn: Binding(
+                    get: { configManager.config.chat.injectTokenUsage },
+                    set: { newValue in configManager.updateChatConfig { $0.injectTokenUsage = newValue } }
+                ))
+
+                Text("今日已消耗 Token: \(usage.todayTokens) / 累计: \(usage.totalTokens)")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Text("可用货币: \(usage.availableCurrency)（今日来源 cache miss \(usage.todayCacheMiss) + output \(usage.todayOutput)）")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                Text("只在发送请求时临时拼在最后一条 user 消息末尾，不写入聊天记录，也不在 UI 渲染。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
             
             if configManager.config.chat.provider == .deepseek {
@@ -715,6 +865,56 @@ struct ChatSettingsView: View {
 
 // MARK: - Behavior Settings
 
+private struct IntNumberStepperRow: View {
+    let title: String
+    let unit: String
+    @Binding var value: Int
+    let range: ClosedRange<Int>
+    let step: Int
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            TextField("", value: $value, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 64)
+            Stepper("", value: $value, in: range, step: step)
+                .labelsHidden()
+            Text(unit)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(minWidth: 32, alignment: .leading)
+        }
+    }
+}
+
+private struct DoubleNumberStepperRow: View {
+    let title: String
+    let unit: String
+    @Binding var value: Double
+    let range: ClosedRange<Double>
+    let step: Double
+
+    var body: some View {
+        HStack {
+            Text(title)
+            Spacer()
+            TextField("", value: $value, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 64)
+            Stepper("", value: $value, in: range, step: step)
+                .labelsHidden()
+            Text(unit)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .frame(minWidth: 32, alignment: .leading)
+        }
+    }
+}
+
 struct BehaviorSettingsView: View {
     @EnvironmentObject var configManager: ConfigManager
     
@@ -792,25 +992,129 @@ struct BehaviorSettingsView: View {
             }
             
             Section("行为参数") {
-                Stepper("空闲阈值: \(configManager.config.pet.behavior.idleThreshold)秒", value: Binding(
+                IntNumberStepperRow(title: "空闲阈值", unit: "秒", value: Binding(
                     get: { configManager.config.pet.behavior.idleThreshold },
                     set: { newValue in configManager.updatePetConfig { $0.behavior.idleThreshold = newValue } }
-                ), in: 10...300, step: 10)
-                
+                ), range: 10...300, step: 10)
+
                 Toggle("自动移动", isOn: Binding(
                     get: { configManager.config.pet.behavior.autoMove },
                     set: { newValue in configManager.updatePetConfig { $0.behavior.autoMove = newValue } }
                 ))
-                
-                Stepper("移动间隔: \(configManager.config.pet.behavior.moveInterval)秒", value: Binding(
+
+                IntNumberStepperRow(title: "移动间隔", unit: "秒", value: Binding(
                     get: { configManager.config.pet.behavior.moveInterval },
                     set: { newValue in configManager.updatePetConfig { $0.behavior.moveInterval = newValue } }
-                ), in: 30...600, step: 30)
-                
-                Stepper("移动距离: \(Int(configManager.config.pet.behavior.moveDistance))像素", value: Binding(
+                ), range: 30...600, step: 30)
+
+                DoubleNumberStepperRow(title: "移动距离", unit: "像素", value: Binding(
                     get: { configManager.config.pet.behavior.moveDistance },
                     set: { newValue in configManager.updatePetConfig { $0.behavior.moveDistance = newValue } }
-                ), in: 10...200, step: 10)
+                ), range: 10...200, step: 10)
+
+                IntNumberStepperRow(title: "行动最小间隔", unit: "秒", value: Binding(
+                    get: { configManager.config.pet.behavior.activityMinInterval },
+                    set: { newValue in
+                        configManager.updatePetConfig {
+                            $0.behavior.activityMinInterval = newValue
+                            if $0.behavior.activityMaxInterval < newValue {
+                                $0.behavior.activityMaxInterval = newValue
+                            }
+                        }
+                    }
+                ), range: 1...60, step: 1)
+
+                IntNumberStepperRow(title: "行动最大间隔", unit: "秒", value: Binding(
+                    get: { configManager.config.pet.behavior.activityMaxInterval },
+                    set: { newValue in
+                        configManager.updatePetConfig {
+                            $0.behavior.activityMaxInterval = newValue
+                            if $0.behavior.activityMinInterval > newValue {
+                                $0.behavior.activityMinInterval = newValue
+                            }
+                        }
+                    }
+                ), range: 1...60, step: 1)
+
+                Divider()
+
+                Toggle("允许跳跃", isOn: Binding(
+                    get: { configManager.config.pet.behavior.allowJump },
+                    set: { newValue in configManager.updatePetConfig { $0.behavior.allowJump = newValue } }
+                ))
+
+                HStack {
+                    Text("跳跃概率: \(Int(configManager.config.pet.behavior.jumpProbability * 100))%")
+                    Slider(value: Binding(
+                        get: { configManager.config.pet.behavior.jumpProbability },
+                        set: { newValue in configManager.updatePetConfig { $0.behavior.jumpProbability = min(max(newValue, 0), 1) } }
+                    ), in: 0...1, step: 0.01)
+                }
+                .disabled(!configManager.config.pet.behavior.allowJump)
+
+                Text("跳跃是独立行为：每次行为决策按概率触发，跳完不会强制接走路。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            Section("难度与物理反馈") {
+                Picker("难度", selection: Binding(
+                    get: { configManager.config.gameplay.difficulty },
+                    set: { newValue in
+                        // 切换难度时载入推荐参数；下面的滑条仍可继续微调。
+                        configManager.updateGameplayConfig { $0 = GameplayConfig.recommended(for: newValue) }
+                    }
+                )) {
+                    ForEach(GameplayDifficulty.allCases) { difficulty in
+                        Text(difficulty.title).tag(difficulty)
+                    }
+                }
+
+                Slider(value: Binding(
+                    get: { configManager.config.gameplay.energyMultiplier },
+                    set: { newValue in configManager.updateGameplayConfig { $0.energyMultiplier = min(max(newValue, 0.5), 2.0) } }
+                ), in: 0.5...2.0, step: 0.1) {
+                    Text("精力消耗倍率: \(String(format: "%.1f", configManager.config.gameplay.energyMultiplier))×")
+                }
+
+                Slider(value: Binding(
+                    get: { configManager.config.gameplay.hungerMultiplier },
+                    set: { newValue in configManager.updateGameplayConfig { $0.hungerMultiplier = min(max(newValue, 0.5), 2.0) } }
+                ), in: 0.5...2.0, step: 0.1) {
+                    Text("饥饿增长倍率: \(String(format: "%.1f", configManager.config.gameplay.hungerMultiplier))×")
+                }
+
+                Slider(value: Binding(
+                    get: { configManager.config.gameplay.happinessMultiplier },
+                    set: { newValue in configManager.updateGameplayConfig { $0.happinessMultiplier = min(max(newValue, 0.5), 2.0) } }
+                ), in: 0.5...2.0, step: 0.1) {
+                    Text("心情变化倍率: \(String(format: "%.1f", configManager.config.gameplay.happinessMultiplier))×")
+                }
+
+                Slider(value: Binding(
+                    get: { Double(configManager.config.gameplay.wallHappinessPenalty) },
+                    set: { newValue in configManager.updateGameplayConfig { $0.wallHappinessPenalty = Int(newValue) } }
+                ), in: 0...50, step: 1) {
+                    Text("撞墙扣心情: \(configManager.config.gameplay.wallHappinessPenalty)")
+                }
+
+                Slider(value: Binding(
+                    get: { Double(configManager.config.gameplay.wallEnergyPenalty) },
+                    set: { newValue in configManager.updateGameplayConfig { $0.wallEnergyPenalty = Int(newValue) } }
+                ), in: 0...100, step: 1) {
+                    Text("撞墙扣精力: \(configManager.config.gameplay.wallEnergyPenalty)")
+                }
+
+                Slider(value: Binding(
+                    get: { Double(configManager.config.gameplay.landingHappinessReward) },
+                    set: { newValue in configManager.updateGameplayConfig { $0.landingHappinessReward = Int(newValue) } }
+                ), in: 0...10, step: 1) {
+                    Text("无碰撞落地奖励: +\(configManager.config.gameplay.landingHappinessReward) 心情")
+                }
+
+                Text("撞墙扣的属性会再乘以对应难度倍率；抛掷全程没撞墙，落地才加心情。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -876,7 +1180,19 @@ struct InteractionSettingsView: View {
                     set: { newValue in configManager.updateInteractionConfig { $0.useAIForInteraction = newValue } }
                 ))
                 
-                Text("开启后，单击、长按、抛掷落地会直接把事件描述发给聊天模型（不走预设台词）；关闭则使用下面的本地反应配置。")
+                Toggle("空中时跳过 AI 请求", isOn: Binding(
+                    get: { configManager.config.interaction.skipAIWhileAirborne },
+                    set: { newValue in configManager.updateInteractionConfig { $0.skipAIWhileAirborne = newValue } }
+                ))
+                
+                Slider(value: Binding(
+                    get: { configManager.config.interaction.apiRequestCooldown },
+                    set: { newValue in configManager.updateInteractionConfig { $0.apiRequestCooldown = newValue } }
+                ), in: 0.2...5.0, step: 0.1) {
+                    Text("API 冷却: \(String(format: "%.1f", configManager.config.interaction.apiRequestCooldown)) 秒")
+                }
+                
+                Text("开启后，单击、长按、抛掷落地会直接把事件描述发给聊天模型（不走预设台词）；关闭则使用下面的本地反应配置。冷却期内或宠物在空中时不会发起请求，直接用本地台词。")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -887,10 +1203,23 @@ struct InteractionSettingsView: View {
                     set: { newValue in configManager.updateInteractionConfig { $0.click.enabled = newValue } }
                 ))
                 
-                ForEach(configManager.config.interaction.click.reactions.indices, id: \.self) { idx in
-                    ClickReactionRow(index: idx, reaction: configManager.config.interaction.click.reactions[idx]) { newReaction in
-                        configManager.updateInteractionConfig { $0.click.reactions[idx] = newReaction }
-                    }
+                ForEach(Array(configManager.config.interaction.click.reactions.enumerated()), id: \.element.id) { idx, reaction in
+                    ClickReactionRow(
+                        index: idx,
+                        reaction: reaction,
+                        onDelete: {
+                            configManager.updateInteractionConfig { config in
+                                guard idx < config.click.reactions.count else { return }
+                                config.click.reactions.remove(at: idx)
+                            }
+                        },
+                        onChange: { newReaction in
+                            configManager.updateInteractionConfig { config in
+                                guard let current = config.click.reactions.firstIndex(where: { $0.id == reaction.id }) else { return }
+                                config.click.reactions[current] = newReaction
+                            }
+                        }
+                    )
                 }
                 
                 Button("添加反应") {
@@ -1000,16 +1329,30 @@ struct InteractionSettingsView: View {
                     set: { newValue in configManager.updateInteractionConfig { $0.feed.enabled = newValue } }
                 ))
                 
-                ForEach(configManager.config.interaction.feed.items.indices, id: \.self) { idx in
-                    FeedItemRow(index: idx, item: configManager.config.interaction.feed.items[idx]) { newItem in
-                        configManager.updateInteractionConfig { $0.feed.items[idx] = newItem }
-                    }
+                ForEach(Array(configManager.config.interaction.feed.items.enumerated()), id: \.element.id) { idx, item in
+                    FeedItemRow(
+                        index: idx,
+                        item: item,
+                        onDelete: {
+                            configManager.updateInteractionConfig { config in
+                                guard idx < config.feed.items.count else { return }
+                                config.feed.items.remove(at: idx)
+                            }
+                        },
+                        onChange: { newItem in
+                            configManager.updateInteractionConfig { config in
+                                guard let current = config.feed.items.firstIndex(where: { $0.id == item.id }) else { return }
+                                config.feed.items[current] = newItem
+                            }
+                        }
+                    )
                 }
                 
                 Button("添加食物") {
                     configManager.updateInteractionConfig {
                         $0.feed.items.append(FeedItemConfig(
-                            name: "新食物", emoji: "🍎", happiness: 5, animation: "EATING", lines: ["好吃"]
+                            name: "新食物", emoji: "🍎", happiness: 5, satiety: 5, energy: 2,
+                            animation: "EATING", lines: ["好吃"]
                         ))
                     }
                 }
@@ -1022,23 +1365,26 @@ struct InteractionSettingsView: View {
 struct ClickReactionRow: View {
     let index: Int
     let reaction: ClickReactionConfig
+    let onDelete: () -> Void
     let onChange: (ClickReactionConfig) -> Void
-    
+
     @State private var animation: String
     @State private var probability: Double
     @State private var speak: Bool
     @State private var linesText: String
-    
-    init(index: Int, reaction: ClickReactionConfig, onChange: @escaping (ClickReactionConfig) -> Void) {
+    @State private var saveWorkItem: DispatchWorkItem?
+
+    init(index: Int, reaction: ClickReactionConfig, onDelete: @escaping () -> Void, onChange: @escaping (ClickReactionConfig) -> Void) {
         self.index = index
         self.reaction = reaction
+        self.onDelete = onDelete
         self.onChange = onChange
         self._animation = State(initialValue: reaction.animation)
         self._probability = State(initialValue: reaction.probability)
         self._speak = State(initialValue: reaction.speak)
         self._linesText = State(initialValue: reaction.lines.joined(separator: "\n"))
     }
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -1048,88 +1394,180 @@ struct ClickReactionRow: View {
                 Spacer()
                 TextField("动画", text: $animation)
                     .frame(width: 100)
-                    .onChange(of: animation) { update() }
+                    .onChange(of: animation) { _ in scheduleUpdate() }
                 Slider(value: $probability, in: 0...1, step: 0.05) {
                     Text("概率: \(Int(probability * 100))%")
                 }
                 .frame(width: 150)
-                .onChange(of: probability) { update() }
+                .onChange(of: probability) { _ in scheduleUpdate() }
                 Toggle("说话", isOn: $speak)
-                    .onChange(of: speak) { update() }
-                Button(action: { onChange(ClickReactionConfig(animation: "", probability: 0, speak: false, lines: [])) }) {
+                    .onChange(of: speak) { _ in scheduleUpdate() }
+                Button(action: onDelete) {
                     Image(systemName: "trash")
                         .foregroundColor(.red)
                 }
                 .buttonStyle(.plain)
             }
-            
+
             TextEditor(text: $linesText)
                 .frame(height: 50)
                 .border(Color.gray.opacity(0.3))
-                .onChange(of: linesText) { update() }
+                .onChange(of: linesText) { _ in scheduleUpdate() }
         }
         .padding(.vertical, 4)
+        .onDisappear {
+            saveWorkItem?.cancel()
+            saveWorkItem = nil
+            update()
+        }
     }
-    
+
+    /// 防抖 300ms：连续输入只更新一次配置，避免每个按键都重绘整个设置页。
+    private func scheduleUpdate() {
+        saveWorkItem?.cancel()
+        let item = DispatchWorkItem { update() }
+        saveWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
+    }
+
     private func update() {
         let lines = linesText.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
-        onChange(ClickReactionConfig(animation: animation, probability: probability, speak: speak, lines: lines))
+        onChange(ClickReactionConfig(
+            id: reaction.id,
+            animation: animation,
+            probability: probability,
+            speak: speak,
+            lines: lines
+        ))
     }
 }
 
 struct FeedItemRow: View {
     let index: Int
     let item: FeedItemConfig
+    let onDelete: () -> Void
     let onChange: (FeedItemConfig) -> Void
-    
+
     @State private var name: String
     @State private var emoji: String
     @State private var happiness: Int
+    @State private var satiety: Int
+    @State private var energy: Int
+    @State private var price: Int
     @State private var animation: String
     @State private var linesText: String
-    
-    init(index: Int, item: FeedItemConfig, onChange: @escaping (FeedItemConfig) -> Void) {
+    @State private var saveWorkItem: DispatchWorkItem?
+
+    init(index: Int, item: FeedItemConfig, onDelete: @escaping () -> Void, onChange: @escaping (FeedItemConfig) -> Void) {
         self.index = index
         self.item = item
+        self.onDelete = onDelete
         self.onChange = onChange
         self._name = State(initialValue: item.name)
         self._emoji = State(initialValue: item.emoji)
         self._happiness = State(initialValue: item.happiness)
+        self._satiety = State(initialValue: item.satiety)
+        self._energy = State(initialValue: item.energy)
+        self._price = State(initialValue: item.price)
         self._animation = State(initialValue: item.animation)
         self._linesText = State(initialValue: item.lines.joined(separator: "\n"))
     }
-    
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
                 TextField("名称", text: $name)
                     .frame(width: 100)
-                    .onChange(of: name) { update() }
+                    .onChange(of: name) { _ in scheduleUpdate() }
                 TextField("表情", text: $emoji)
                     .frame(width: 40)
-                    .onChange(of: emoji) { update() }
-                Stepper("开心度: \(happiness)", value: $happiness, in: 1...50)
-                    .onChange(of: happiness) { update() }
+                    .onChange(of: emoji) { _ in scheduleUpdate() }
                 TextField("动画", text: $animation)
                     .frame(width: 80)
-                    .onChange(of: animation) { update() }
-                Button(action: { onChange(FeedItemConfig(name: "", emoji: "", happiness: 0, animation: "", lines: [])) }) {
+                    .onChange(of: animation) { _ in scheduleUpdate() }
+                Button(action: onDelete) {
                     Image(systemName: "trash").foregroundColor(.red)
                 }
                 .buttonStyle(.plain)
             }
-            
+
+            HStack(spacing: 16) {
+                IntNumberStepperRow(
+                    title: "开心度",
+                    unit: "",
+                    value: $happiness,
+                    range: 1...50,
+                    step: 1
+                )
+                .frame(maxWidth: 220)
+                .onChange(of: happiness) { _ in scheduleUpdate() }
+
+                IntNumberStepperRow(
+                    title: "价格",
+                    unit: "",
+                    value: $price,
+                    range: 0...1000,
+                    step: 10
+                )
+                .frame(maxWidth: 220)
+                .onChange(of: price) { _ in scheduleUpdate() }
+            }
+
+            HStack(spacing: 16) {
+                IntNumberStepperRow(
+                    title: "饱腹度",
+                    unit: "",
+                    value: $satiety,
+                    range: 0...50,
+                    step: 1
+                )
+                .frame(maxWidth: 220)
+                .onChange(of: satiety) { _ in scheduleUpdate() }
+
+                IntNumberStepperRow(
+                    title: "精力",
+                    unit: "",
+                    value: $energy,
+                    range: -20...20,
+                    step: 1
+                )
+                .frame(maxWidth: 220)
+                .onChange(of: energy) { _ in scheduleUpdate() }
+            }
+
             TextEditor(text: $linesText)
                 .frame(height: 50)
                 .border(Color.gray.opacity(0.3))
-                .onChange(of: linesText) { update() }
+                .onChange(of: linesText) { _ in scheduleUpdate() }
         }
         .padding(.vertical, 4)
+        .onDisappear {
+            saveWorkItem?.cancel()
+            saveWorkItem = nil
+            update()
+        }
     }
-    
+
+    private func scheduleUpdate() {
+        saveWorkItem?.cancel()
+        let item = DispatchWorkItem { update() }
+        saveWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
+    }
+
     private func update() {
         let lines = linesText.split(separator: "\n").map(String.init).filter { !$0.isEmpty }
-        onChange(FeedItemConfig(name: name, emoji: emoji, happiness: happiness, animation: animation, lines: lines))
+        onChange(FeedItemConfig(
+            id: item.id,
+            name: name,
+            emoji: emoji,
+            happiness: happiness,
+            satiety: satiety,
+            energy: energy,
+            price: price,
+            animation: animation,
+            lines: lines
+        ))
     }
 }
 
@@ -1180,7 +1618,7 @@ struct AdvancedSettingsView: View {
             }
             
             Section("调试") {
-                Button("重置宠物状态") { PetState.shared.resetState() }
+                Button("重置宠物状态") { PetController.shared.resetPetState() }
                     .foregroundColor(.orange)
                 Button("打开配置文件夹") { openConfigFolder() }
                 Button("打开模型文件夹") { openModelFolder() }
@@ -1260,5 +1698,105 @@ extension ConfigManager {
     func updateDataConfig(_ block: (inout DataConfig) -> Void) {
         block(&config.data)
         saveConfig()
+    }
+}
+
+// MARK: - Debug Settings
+
+struct DebugSettingsView: View {
+    @ObservedObject private var logger = ChatDebugLogger.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("最近 20 次聊天请求")
+                    .font(.headline)
+                Spacer()
+                Button("导出为 .txt") {
+                    exportLogs()
+                }
+                .disabled(logger.logs.isEmpty)
+                Button("清空") {
+                    logger.clear()
+                }
+                .disabled(logger.logs.isEmpty)
+            }
+
+            Toggle("启用调试抓包", isOn: $logger.isEnabled)
+                .toggleStyle(.switch)
+
+            if logger.logs.isEmpty {
+                Spacer()
+                Text("还没有聊天请求。发一条消息后，这里会显示完整的 Request / Response JSON。")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .frame(maxWidth: .infinity)
+                Spacer()
+            } else {
+                List(logger.logs) { entry in
+                    DisclosureGroup {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Request JSON")
+                                .font(.caption.bold())
+                            Text(entry.requestJSON)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+
+                            Text("Response JSON")
+                                .font(.caption.bold())
+                            Text(entry.responseJSON)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                        }
+                        .padding(.vertical, 4)
+                    } label: {
+                        HStack {
+                            Text(entry.timestamp, style: .time)
+                                .font(.caption.monospacedDigit())
+                            Text(entry.provider)
+                                .font(.caption.bold())
+                            Spacer()
+                            Text("prompt \(entry.promptTokens) / completion \(entry.completionTokens) / miss \(entry.cacheMissTokens)")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+        .padding()
+    }
+
+    private func exportLogs() {
+        guard !logger.logs.isEmpty else { return }
+
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        let text = logger.logs.map { entry -> String in
+            """
+            [\(formatter.string(from: entry.timestamp))] \(entry.provider)
+            prompt=\(entry.promptTokens) completion=\(entry.completionTokens) cacheMiss=\(entry.cacheMissTokens)
+
+            Request:
+            \(entry.requestJSON)
+
+            Response:
+            \(entry.responseJSON)
+            """
+        }.joined(separator: "\n\n----------------------------------------\n\n")
+
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        let stamp = formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        panel.nameFieldStringValue = "DebuSeek-ChatDebug-\(stamp).txt"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                try text.write(to: url, atomically: true, encoding: .utf8)
+            } catch {
+                NSLog("🐞 debug export failed: \(error)")
+            }
+        }
     }
 }

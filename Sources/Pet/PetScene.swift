@@ -250,6 +250,9 @@ class PetScene: SKScene {
     var speechBubble: SpeechBubbleNode?
     /// 防止旧气泡的隐藏定时器误关新气泡
     private var speechBubbleGeneration: Int = 0
+    /// 轻提示（投喂反馈等），同一时间只保留一个
+    private var toastNode: SKNode?
+    private var toastWorkItem: DispatchWorkItem?
     /// 气泡独立存活计时：只由它负责隐藏气泡，TALKING/TTS 结束不碰气泡
     private var speechHideWorkItem: DispatchWorkItem?
 
@@ -485,6 +488,48 @@ class PetScene: SKScene {
                 self?.onSpeechHeightReset?()
             }
         }
+    }
+
+    /// 宠物头顶的轻量 Toast（投喂反馈等），1.5 秒后自动淡出销毁。
+    func showToast(_ text: String, duration: TimeInterval = 1.5) {
+        toastWorkItem?.cancel()
+        toastWorkItem = nil
+        toastNode?.removeFromParent()
+        toastNode = nil
+
+        let label = SKLabelNode(fontNamed: "Helvetica-Bold")
+        label.text = text
+        label.fontSize = 12
+        label.fontColor = .white
+        label.verticalAlignmentMode = .center
+        label.horizontalAlignmentMode = .center
+
+        let width = max(92, label.frame.width + 24)
+        let height = max(26, label.frame.height + 14)
+        let shape = SKShapeNode(rectOf: CGSize(width: width, height: height), cornerRadius: height / 2)
+        shape.fillColor = NSColor.black.withAlphaComponent(0.72)
+        shape.strokeColor = NSColor.white.withAlphaComponent(0.18)
+        shape.lineWidth = 1
+        shape.zPosition = 999
+        shape.position = CGPoint(x: petNode.position.x, y: petNode.frame.maxY + 40)
+        shape.alpha = 0
+        shape.addChild(label)
+        addChild(shape)
+        toastNode = shape
+        shape.run(.fadeIn(withDuration: 0.12))
+
+        let item = DispatchWorkItem { [weak self, weak shape] in
+            guard let shape = shape else { return }
+            shape.run(.sequence([
+                .fadeOut(withDuration: 0.25),
+                .removeFromParent()
+            ]))
+            if let self = self, self.toastNode === shape {
+                self.toastNode = nil
+            }
+        }
+        toastWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + duration, execute: item)
     }
 
     /// 点击气泡：0.2 秒放大到 1.2 + 淡出，随后移除；不触发鱼身互动。

@@ -37,8 +37,18 @@ struct ChatView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 12) {
                         ForEach(chatHistory.messages) { message in
-                            MessageBubble(message: message)
-                                .id(message.id)
+                            Group {
+                                if message.role == .systemNote {
+                                    Text(message.content)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .frame(maxWidth: .infinity, alignment: .center)
+                                        .padding(.vertical, 4)
+                                } else {
+                                    MessageBubble(message: message)
+                                }
+                            }
+                            .id(message.id)
                         }
                         
                         if isSending {

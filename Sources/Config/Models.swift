@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 
 // MARK: - Configuration Models
 
@@ -13,9 +14,64 @@ struct AppConfig: Codable {
     var menuBar: MenuBarConfig
     var notifications: NotificationsConfig
     var data: DataConfig
+    /// 难度与物理反馈参数
+    var gameplay: GameplayConfig
     /// 全局快捷键（首次点击宠物后注册），格式如 "option+s"
     var hotkeySettings: String? = nil
     var hotkeyChat: String? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case pet, tts, chat, autoSpeech, timeReport, interaction, window, menuBar, notifications, data, gameplay
+        case hotkeySettings, hotkeyChat
+    }
+
+    init(
+        pet: PetConfig,
+        tts: TTSConfig,
+        chat: ChatConfig,
+        autoSpeech: AutoSpeechConfig,
+        timeReport: TimeReportConfig,
+        interaction: InteractionConfig,
+        window: WindowConfig,
+        menuBar: MenuBarConfig,
+        notifications: NotificationsConfig,
+        data: DataConfig,
+        gameplay: GameplayConfig = .default,
+        hotkeySettings: String? = nil,
+        hotkeyChat: String? = nil
+    ) {
+        self.pet = pet
+        self.tts = tts
+        self.chat = chat
+        self.autoSpeech = autoSpeech
+        self.timeReport = timeReport
+        self.interaction = interaction
+        self.window = window
+        self.menuBar = menuBar
+        self.notifications = notifications
+        self.data = data
+        self.gameplay = gameplay
+        self.hotkeySettings = hotkeySettings
+        self.hotkeyChat = hotkeyChat
+    }
+
+    /// 旧 config.json 没有 gameplay 等新字段时逐项兜底，避免整份配置被重置。
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        pet = try c.decodeIfPresent(PetConfig.self, forKey: .pet) ?? .default
+        tts = try c.decodeIfPresent(TTSConfig.self, forKey: .tts) ?? .default
+        chat = try c.decodeIfPresent(ChatConfig.self, forKey: .chat) ?? .default
+        autoSpeech = try c.decodeIfPresent(AutoSpeechConfig.self, forKey: .autoSpeech) ?? .default
+        timeReport = try c.decodeIfPresent(TimeReportConfig.self, forKey: .timeReport) ?? .default
+        interaction = try c.decodeIfPresent(InteractionConfig.self, forKey: .interaction) ?? .default
+        window = try c.decodeIfPresent(WindowConfig.self, forKey: .window) ?? .default
+        menuBar = try c.decodeIfPresent(MenuBarConfig.self, forKey: .menuBar) ?? .default
+        notifications = try c.decodeIfPresent(NotificationsConfig.self, forKey: .notifications) ?? .default
+        data = try c.decodeIfPresent(DataConfig.self, forKey: .data) ?? .default
+        gameplay = try c.decodeIfPresent(GameplayConfig.self, forKey: .gameplay) ?? .default
+        hotkeySettings = try c.decodeIfPresent(String.self, forKey: .hotkeySettings)
+        hotkeyChat = try c.decodeIfPresent(String.self, forKey: .hotkeyChat)
+    }
     
     static let `default` = AppConfig(
         pet: PetConfig.default,
@@ -27,7 +83,8 @@ struct AppConfig: Codable {
         window: WindowConfig.default,
         menuBar: MenuBarConfig.default,
         notifications: NotificationsConfig.default,
-        data: DataConfig.default
+        data: DataConfig.default,
+        gameplay: GameplayConfig.default
     )
 }
 
@@ -170,12 +227,64 @@ struct PetBehaviorConfig: Codable {
     var autoMove: Bool
     var moveInterval: Int
     var moveDistance: Double
-    
+
+    /// 行为决策的随机间隔范围（秒）。心跳每 tick 到期后重新随机，不再固定 10 秒。
+    var activityMinInterval: Int
+    var activityMaxInterval: Int
+
+    /// 是否允许自主跳跃。
+    var allowJump: Bool
+    /// 每次行为决策时触发跳跃的概率（0~1）。
+    var jumpProbability: Double
+
+    private enum CodingKeys: String, CodingKey {
+        case idleThreshold, autoMove, moveInterval, moveDistance
+        case activityMinInterval, activityMaxInterval
+        case allowJump, jumpProbability
+    }
+
+    init(
+        idleThreshold: Int = 30,
+        autoMove: Bool = true,
+        moveInterval: Int = 120,
+        moveDistance: Double = 50,
+        activityMinInterval: Int = 5,
+        activityMaxInterval: Int = 10,
+        allowJump: Bool = true,
+        jumpProbability: Double = 0.1
+    ) {
+        self.idleThreshold = idleThreshold
+        self.autoMove = autoMove
+        self.moveInterval = moveInterval
+        self.moveDistance = moveDistance
+        self.activityMinInterval = activityMinInterval
+        self.activityMaxInterval = activityMaxInterval
+        self.allowJump = allowJump
+        self.jumpProbability = jumpProbability
+    }
+
+    /// 兼容旧 pet config：缺失新字段时回退到 5~10 秒 / 允许跳跃 / 10%。
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        idleThreshold = try container.decodeIfPresent(Int.self, forKey: .idleThreshold) ?? 30
+        autoMove = try container.decodeIfPresent(Bool.self, forKey: .autoMove) ?? true
+        moveInterval = try container.decodeIfPresent(Int.self, forKey: .moveInterval) ?? 120
+        moveDistance = try container.decodeIfPresent(Double.self, forKey: .moveDistance) ?? 50
+        activityMinInterval = try container.decodeIfPresent(Int.self, forKey: .activityMinInterval) ?? 5
+        activityMaxInterval = try container.decodeIfPresent(Int.self, forKey: .activityMaxInterval) ?? 10
+        allowJump = try container.decodeIfPresent(Bool.self, forKey: .allowJump) ?? true
+        jumpProbability = try container.decodeIfPresent(Double.self, forKey: .jumpProbability) ?? 0.1
+    }
+
     static let `default` = PetBehaviorConfig(
         idleThreshold: 30,
         autoMove: true,
         moveInterval: 120,
-        moveDistance: 50
+        moveDistance: 50,
+        activityMinInterval: 5,
+        activityMaxInterval: 10,
+        allowJump: true,
+        jumpProbability: 0.1
     )
 }
 
@@ -253,8 +362,31 @@ struct ChatConfig: Codable {
     /// 聊天回复是否朗读。默认 false：聊天只显示气泡，不播 TALKING、不调用 TTS。
     var readChatAloud: Bool = false
 
+    // MARK: - Rolling Memory
+
+    /// 历史对话压缩后的长期回忆录；会作为 system 的一部分注入聊天请求。
+    var memorySummary: String = ""
+    /// 用户自定义的摘要提示词；支持 {transcript} 占位符，留空则用内置提示词。
+    var customSummaryPrompt: String = ""
+    /// 长期记忆总开关：关闭后既不注入回忆录，也不允许压缩。
+    var enableMemorySummarization: Bool = false
+    /// 历史达到 autoSummarizeRounds * 2 条时，是否自动后台压缩。
+    var enableAutoSummarize: Bool = false
+    /// 自动压缩的轮数阈值（一轮 = 一条 user + 一条 assistant）。
+    var autoSummarizeRounds: Int = 10
+
+    // MARK: - Token Awareness
+
+    /// 是否在本次请求最后一条 user 消息末尾临时追加极简 Token 提示。
+    /// 该提示只存在于请求数组中，绝不写入 ChatHistoryManager。
+    var injectTokenUsage: Bool = false
+    /// 用户希望宠物怎么称呼自己；空字符串表示不注入。
+    var userNickname: String = ""
+
     private enum CodingKeys: String, CodingKey {
         case enabled, provider, deepseek, localLlm, readChatAloud
+        case memorySummary, customSummaryPrompt, enableMemorySummarization, enableAutoSummarize, autoSummarizeRounds
+        case injectTokenUsage, userNickname
     }
 
     init(
@@ -262,16 +394,30 @@ struct ChatConfig: Codable {
         provider: ChatProvider,
         deepseek: DeepSeekConfig,
         localLlm: LocalLLMConfig,
-        readChatAloud: Bool = false
+        readChatAloud: Bool = false,
+        memorySummary: String = "",
+        customSummaryPrompt: String = "",
+        enableMemorySummarization: Bool = false,
+        enableAutoSummarize: Bool = false,
+        autoSummarizeRounds: Int = 10,
+        injectTokenUsage: Bool = false,
+        userNickname: String = ""
     ) {
         self.enabled = enabled
         self.provider = provider
         self.deepseek = deepseek
         self.localLlm = localLlm
         self.readChatAloud = readChatAloud
+        self.memorySummary = memorySummary
+        self.customSummaryPrompt = customSummaryPrompt
+        self.enableMemorySummarization = enableMemorySummarization
+        self.enableAutoSummarize = enableAutoSummarize
+        self.autoSummarizeRounds = autoSummarizeRounds
+        self.injectTokenUsage = injectTokenUsage
+        self.userNickname = userNickname
     }
 
-    /// 兼容旧 config.json：没有 readChatAloud 字段时默认 false，避免整份配置解码失败被重置。
+    /// 兼容旧 config.json：所有新增字段缺失时都走默认值，避免整份配置解码失败被重置。
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         enabled = try container.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
@@ -279,6 +425,13 @@ struct ChatConfig: Codable {
         deepseek = try container.decodeIfPresent(DeepSeekConfig.self, forKey: .deepseek) ?? .default
         localLlm = try container.decodeIfPresent(LocalLLMConfig.self, forKey: .localLlm) ?? .default
         readChatAloud = try container.decodeIfPresent(Bool.self, forKey: .readChatAloud) ?? false
+        memorySummary = try container.decodeIfPresent(String.self, forKey: .memorySummary) ?? ""
+        customSummaryPrompt = try container.decodeIfPresent(String.self, forKey: .customSummaryPrompt) ?? ""
+        enableMemorySummarization = try container.decodeIfPresent(Bool.self, forKey: .enableMemorySummarization) ?? false
+        enableAutoSummarize = try container.decodeIfPresent(Bool.self, forKey: .enableAutoSummarize) ?? false
+        autoSummarizeRounds = try container.decodeIfPresent(Int.self, forKey: .autoSummarizeRounds) ?? 10
+        injectTokenUsage = try container.decodeIfPresent(Bool.self, forKey: .injectTokenUsage) ?? false
+        userNickname = try container.decodeIfPresent(String.self, forKey: .userNickname) ?? ""
     }
 
     /// 当前 provider 实际生效的系统提示词（请求层统一从这里读取）
@@ -410,6 +563,10 @@ struct InteractionConfig: Codable {
     var feed: FeedInteractionConfig
     /// 物理互动是否直接请求大模型（关闭时走 DialogueManager 预设台词）
     var useAIForInteraction: Bool
+    /// 两次 AI 互动请求之间的最小间隔（秒）
+    var apiRequestCooldown: Double
+    /// 宠物在空中时跳过 AI 请求，避免抛掷/落地瞬间刷请求
+    var skipAIWhileAirborne: Bool
 
     static let `default` = InteractionConfig(
         click: ClickInteractionConfig.default,
@@ -418,7 +575,9 @@ struct InteractionConfig: Codable {
         drag: DragInteractionConfig.default,
         longPress: LongPressInteractionConfig.default,
         feed: FeedInteractionConfig.default,
-        useAIForInteraction: false
+        useAIForInteraction: false,
+        apiRequestCooldown: 1.0,
+        skipAIWhileAirborne: true
     )
 
     init(
@@ -428,7 +587,9 @@ struct InteractionConfig: Codable {
         drag: DragInteractionConfig,
         longPress: LongPressInteractionConfig,
         feed: FeedInteractionConfig,
-        useAIForInteraction: Bool = false
+        useAIForInteraction: Bool = false,
+        apiRequestCooldown: Double = 1.0,
+        skipAIWhileAirborne: Bool = true
     ) {
         self.click = click
         self.doubleClick = doubleClick
@@ -437,6 +598,8 @@ struct InteractionConfig: Codable {
         self.longPress = longPress
         self.feed = feed
         self.useAIForInteraction = useAIForInteraction
+        self.apiRequestCooldown = apiRequestCooldown
+        self.skipAIWhileAirborne = skipAIWhileAirborne
     }
 
     enum CodingKeys: String, CodingKey {
@@ -447,6 +610,8 @@ struct InteractionConfig: Codable {
         case longPress
         case feed
         case useAIForInteraction
+        case apiRequestCooldown
+        case skipAIWhileAirborne
     }
 
     init(from decoder: Decoder) throws {
@@ -458,6 +623,8 @@ struct InteractionConfig: Codable {
         longPress = try container.decodeIfPresent(LongPressInteractionConfig.self, forKey: .longPress) ?? .default
         feed = try container.decodeIfPresent(FeedInteractionConfig.self, forKey: .feed) ?? .default
         useAIForInteraction = try container.decodeIfPresent(Bool.self, forKey: .useAIForInteraction) ?? false
+        apiRequestCooldown = try container.decodeIfPresent(Double.self, forKey: .apiRequestCooldown) ?? 1.0
+        skipAIWhileAirborne = try container.decodeIfPresent(Bool.self, forKey: .skipAIWhileAirborne) ?? true
     }
 }
 
@@ -475,11 +642,35 @@ struct ClickInteractionConfig: Codable {
     )
 }
 
-struct ClickReactionConfig: Codable {
+struct ClickReactionConfig: Codable, Identifiable {
+    /// 稳定身份：用于 SwiftUI ForEach，避免用数组下标导致删除/编辑错位。
+    /// 不参与 Codable，旧配置文件解码时自动生成新的 UUID。
+    let id: UUID
     var animation: String
     var probability: Double
     var speak: Bool
     var lines: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case animation, probability, speak, lines
+    }
+
+    init(id: UUID = UUID(), animation: String, probability: Double, speak: Bool, lines: [String]) {
+        self.id = id
+        self.animation = animation
+        self.probability = probability
+        self.speak = speak
+        self.lines = lines
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = UUID()
+        animation = try container.decodeIfPresent(String.self, forKey: .animation) ?? ""
+        probability = try container.decodeIfPresent(Double.self, forKey: .probability) ?? 0
+        speak = try container.decodeIfPresent(Bool.self, forKey: .speak) ?? true
+        lines = try container.decodeIfPresent([String].self, forKey: .lines) ?? []
+    }
 }
 
 struct DoubleClickInteractionConfig: Codable {
@@ -541,20 +732,209 @@ struct FeedInteractionConfig: Codable {
     
     static let `default` = FeedInteractionConfig(
         enabled: true,
-        items: [
-            FeedItemConfig(name: "小虾米", emoji: "🍤", happiness: 10, animation: "EATING", lines: ["好吃！", "谢谢~", "还要！"]),
-            FeedItemConfig(name: "海藻", emoji: "🌿", happiness: 5, animation: "EATING", lines: ["健康~", "咕嘟~"]),
-            FeedItemConfig(name: "泡泡糖", emoji: "🫧", happiness: 15, animation: "HAPPY", lines: ["甜甜的！", "吹泡泡~"])
-        ]
+        items: defaultItems(for: .normal)
     )
+
+    /// 按难度返回预设食物与价格；旧配置里的 price 仍然按 0 兼容。
+    static func defaultItems(for difficulty: GameplayDifficulty) -> [FeedItemConfig] {
+        let shrimp: Int
+        let seaweed: Int
+        let candy: Int
+        switch difficulty {
+        case .easy:
+            shrimp = 50; seaweed = 20; candy = 80
+        case .normal:
+            shrimp = 100; seaweed = 40; candy = 150
+        case .realistic:
+            shrimp = 200; seaweed = 80; candy = 300
+        }
+        return [
+            FeedItemConfig(name: "小虾米", emoji: "🍤", happiness: 10, satiety: 12, energy: 5, price: shrimp, animation: "EATING", lines: ["好吃！", "谢谢~", "还要！"]),
+            FeedItemConfig(name: "海藻", emoji: "🌿", happiness: 5, satiety: 6, energy: 2, price: seaweed, animation: "EATING", lines: ["健康~", "咕嘟~"]),
+            FeedItemConfig(name: "泡泡糖", emoji: "🫧", happiness: 15, satiety: 8, energy: 10, price: candy, animation: "HAPPY", lines: ["甜甜的！", "吹泡泡~"])
+        ]
+    }
 }
 
-struct FeedItemConfig: Codable {
+struct FeedItemConfig: Codable, Identifiable {
+    /// 稳定身份：ForEach 删除/编辑不再依赖数组下标。
+    let id: UUID
     var name: String
     var emoji: String
     var happiness: Int
+    /// 饱腹度加成：喂食时 hunger 减少这么多
+    var satiety: Int
+    /// 精力加成：可以为负
+    var energy: Int
+    /// 价格（Token 货币）；0 表示免费
+    var price: Int
     var animation: String
     var lines: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case name, emoji, happiness, satiety, energy, price, animation, lines
+    }
+
+    init(
+        id: UUID = UUID(),
+        name: String,
+        emoji: String,
+        happiness: Int,
+        satiety: Int = 0,
+        energy: Int = 0,
+        price: Int = 0,
+        animation: String,
+        lines: [String]
+    ) {
+        self.id = id
+        self.name = name
+        self.emoji = emoji
+        self.happiness = happiness
+        self.satiety = satiety
+        self.energy = energy
+        self.price = price
+        self.animation = animation
+        self.lines = lines
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = UUID()
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+        emoji = try container.decodeIfPresent(String.self, forKey: .emoji) ?? ""
+        happiness = try container.decodeIfPresent(Int.self, forKey: .happiness) ?? 0
+        satiety = try container.decodeIfPresent(Int.self, forKey: .satiety) ?? 0
+        energy = try container.decodeIfPresent(Int.self, forKey: .energy) ?? 0
+        price = try container.decodeIfPresent(Int.self, forKey: .price) ?? 0
+        animation = try container.decodeIfPresent(String.self, forKey: .animation) ?? ""
+        lines = try container.decodeIfPresent([String].self, forKey: .lines) ?? []
+    }
+}
+
+// MARK: - Gameplay Configuration
+
+enum GameplayDifficulty: String, Codable, CaseIterable, Identifiable {
+    case easy
+    case normal
+    case realistic
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .easy: return "轻松"
+        case .normal: return "普通"
+        case .realistic: return "拟真"
+        }
+    }
+}
+
+/// 难度、消耗倍率与物理反馈。所有新字段都有默认值，旧配置可直接解码。
+struct GameplayConfig: Codable {
+    var difficulty: GameplayDifficulty
+    /// 精力消耗倍率
+    var energyMultiplier: Double
+    /// 饥饿增长倍率
+    var hungerMultiplier: Double
+    /// 心情变化倍率
+    var happinessMultiplier: Double
+    /// 撞墙扣心情
+    var wallHappinessPenalty: Int
+    /// 撞墙扣精力
+    var wallEnergyPenalty: Int
+    /// 无碰撞落地奖励心情
+    var landingHappinessReward: Int
+    /// 地板安全区高度：窗口底边低于该值时，松手不抛掷、落地不扣血
+    var floorSafeHeight: CGFloat
+
+    static let `default` = GameplayConfig(
+        difficulty: .normal,
+        energyMultiplier: 1.0,
+        hungerMultiplier: 1.0,
+        happinessMultiplier: 1.0,
+        wallHappinessPenalty: 12,
+        wallEnergyPenalty: 30,
+        landingHappinessReward: 2,
+        floorSafeHeight: 200
+    )
+
+    init(
+        difficulty: GameplayDifficulty = .normal,
+        energyMultiplier: Double = 1.0,
+        hungerMultiplier: Double = 1.0,
+        happinessMultiplier: Double = 1.0,
+        wallHappinessPenalty: Int = 12,
+        wallEnergyPenalty: Int = 30,
+        landingHappinessReward: Int = 2,
+        floorSafeHeight: CGFloat = 200
+    ) {
+        self.difficulty = difficulty
+        self.energyMultiplier = energyMultiplier
+        self.hungerMultiplier = hungerMultiplier
+        self.happinessMultiplier = happinessMultiplier
+        self.wallHappinessPenalty = wallHappinessPenalty
+        self.wallEnergyPenalty = wallEnergyPenalty
+        self.landingHappinessReward = landingHappinessReward
+        self.floorSafeHeight = floorSafeHeight
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case difficulty, energyMultiplier, hungerMultiplier, happinessMultiplier
+        case wallHappinessPenalty, wallEnergyPenalty, landingHappinessReward
+        case floorSafeHeight
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let diff = try c.decodeIfPresent(GameplayDifficulty.self, forKey: .difficulty) ?? .normal
+        let preset = GameplayConfig.recommended(for: diff)
+        difficulty = diff
+        energyMultiplier = try c.decodeIfPresent(Double.self, forKey: .energyMultiplier) ?? preset.energyMultiplier
+        hungerMultiplier = try c.decodeIfPresent(Double.self, forKey: .hungerMultiplier) ?? preset.hungerMultiplier
+        happinessMultiplier = try c.decodeIfPresent(Double.self, forKey: .happinessMultiplier) ?? preset.happinessMultiplier
+        wallHappinessPenalty = try c.decodeIfPresent(Int.self, forKey: .wallHappinessPenalty) ?? preset.wallHappinessPenalty
+        wallEnergyPenalty = try c.decodeIfPresent(Int.self, forKey: .wallEnergyPenalty) ?? preset.wallEnergyPenalty
+        landingHappinessReward = try c.decodeIfPresent(Int.self, forKey: .landingHappinessReward) ?? preset.landingHappinessReward
+        floorSafeHeight = try c.decodeIfPresent(CGFloat.self, forKey: .floorSafeHeight) ?? preset.floorSafeHeight
+    }
+
+    static func recommended(for difficulty: GameplayDifficulty) -> GameplayConfig {
+        switch difficulty {
+        case .easy:
+            return GameplayConfig(
+                difficulty: .easy,
+                energyMultiplier: 0.7,
+                hungerMultiplier: 0.8,
+                happinessMultiplier: 0.7,
+                wallHappinessPenalty: 8,
+                wallEnergyPenalty: 20,
+                landingHappinessReward: 3,
+                floorSafeHeight: 200
+            )
+        case .normal:
+            return GameplayConfig(
+                difficulty: .normal,
+                energyMultiplier: 1.0,
+                hungerMultiplier: 1.0,
+                happinessMultiplier: 1.0,
+                wallHappinessPenalty: 12,
+                wallEnergyPenalty: 30,
+                landingHappinessReward: 2,
+                floorSafeHeight: 200
+            )
+        case .realistic:
+            return GameplayConfig(
+                difficulty: .realistic,
+                energyMultiplier: 1.5,
+                hungerMultiplier: 1.3,
+                happinessMultiplier: 1.4,
+                wallHappinessPenalty: 20,
+                wallEnergyPenalty: 45,
+                landingHappinessReward: 1,
+                floorSafeHeight: 200
+            )
+        }
+    }
 }
 
 // MARK: - Window Configuration

@@ -1,12 +1,13 @@
 import Foundation
 import AVFoundation
 import Combine
+import CryptoKit
 
 // MARK: - TTS Service Protocol
 
 @MainActor
 protocol TTSServiceProtocol: AnyObject {
-    func speak(_ text: String) async throws
+    func speak(_ text: String, isDynamic: Bool) async throws
     func stop()
     var isSpeaking: Bool { get }
     /// 全局音量（0...1）
@@ -85,12 +86,17 @@ final class TTSServiceManager: ObservableObject {
         currentService = service
     }
 
-    func speak(_ text: String) async {
+    func speak(_ text: String, isDynamic: Bool = false) async {
         let spoken = TTSTextSanitizer.spokenText(from: text)
 
-        guard ConfigManager.shared.config.tts.enabled else { return }
+        guard ConfigManager.shared.config.tts.enabled else {
+            print("🔇 TTS: 已禁用 → stop 当前语音")
+            stop()
+            return
+        }
         guard let service = currentService else {
             print("⚠️ TTS: 没有可用的语音服务，跳过")
+            stop()
             return
         }
 
@@ -111,11 +117,12 @@ final class TTSServiceManager: ObservableObject {
         defer {
             if generation == myGeneration {
                 isSpeaking = false
+                print("🔊 TTS isSpeaking=false (gen \(myGeneration))")
             }
         }
 
         do {
-            try await service.speak(spoken)
+            try await service.speak(spoken, isDynamic: isDynamic)
         } catch {
             guard generation == myGeneration else { return }
             print("❌ TTS Error: \(error.localizedDescription)")
@@ -133,7 +140,7 @@ final class TTSServiceManager: ObservableObject {
             system.volume = volume
             system.speed = speed
             do {
-                try await system.speak(spoken)
+                try await system.speak(spoken, isDynamic: isDynamic)
             } catch {
                 print("❌ TTS Fallback Error: \(error.localizedDescription)")
             }
@@ -149,6 +156,7 @@ final class TTSServiceManager: ObservableObject {
         fallbackService?.stop()
         fallbackService = nil
         isSpeaking = false
+        print("🔊 TTS isSpeaking=false (stop)")
     }
 }
 
@@ -166,7 +174,7 @@ final class CloudTTSService: TTSServiceProtocol {
     /// 请求/播放代次：被新请求或 stop 打断后，旧回调直接丢弃
     private var generation = 0
 
-    func speak(_ text: String) async throws {
+    func speak(_ text: String, isDynamic: Bool = false) async throws {
         generation += 1
         let myGeneration = generation
         cancelPlayback()
@@ -298,12 +306,63 @@ final class LocalGptSovitsService: TTSServiceProtocol {
     var volume: Float = 0.3
     var speed: Double = 1.0
 
+    // MARK: - 本地语音缓存
+
+    /// ~/Library/Application Support/DebuSeek/Cache/
+    static var cacheDirectory: URL {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+        return base.appendingPathComponent("DebuSeek/Cache", isDirectory: true)
+    }
+
+    /// 删除缓存目录中的所有 .wav，返回清理数量。
+    @discardableResult
+    static func clearCache() -> Int {
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(
+            at: cacheDirectory,
+            includingPropertiesForKeys: nil
+        ) else { return 0 }
+
+        var removed = 0
+        for file in files where file.pathExtension.lowercased() == "wav" {
+            if (try? fm.removeItem(at: file)) != nil {
+                removed += 1
+            }
+        }
+        return removed
+    }
+
+    private static func cacheFileURL(
+        text: String,
+        config: LocalGptSovitsConfig,
+        speed: Double
+    ) -> URL {
+        let material = [
+            text,
+            config.referWavPath,
+            config.promptText,
+            config.promptLanguage,
+            config.textLanguage,
+            String(config.topK),
+            String(format: "%.4f", config.topP),
+            String(format: "%.4f", config.temperature),
+            String(format: "%.4f", speed)
+        ].joined(separator: "|")
+
+        let digest = SHA256.hash(data: Data(material.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return cacheDirectory.appendingPathComponent("\(digest).wav")
+    }
+
     private let audioPlayer = AVPlayer()
     private var activeGate: TTSCallbackGate?
     /// 请求/播放代次：被新请求或 stop 打断后，旧回调直接丢弃
     private var generation = 0
 
-    func speak(_ text: String) async throws {
+    func speak(_ text: String, isDynamic: Bool = false) async throws {
         generation += 1
         let myGeneration = generation
         cancelPlayback()
@@ -333,6 +392,23 @@ final class LocalGptSovitsService: TTSServiceProtocol {
         guard !refAudioPath.isEmpty, !promptText.isEmpty else {
             print("🔊 TTS: GPT-SoVITS 参考音频或参考文本为空 → 回退系统语音")
             throw TTSError.invalidConfiguration
+        }
+
+        // 缓存命中：直接播本地 wav，跳过网络请求和本地推理。
+        let cacheURL = Self.cacheFileURL(text: text, config: config, speed: speed)
+        if !isDynamic,
+           let attributes = try? FileManager.default.attributesOfItem(atPath: cacheURL.path),
+           let fileSize = attributes[.size] as? NSNumber,
+           fileSize.intValue > 44 {
+            print("🔊 TTS[GPT-SoVITS]: 命中缓存 \(cacheURL.lastPathComponent) → 跳过 API")
+            isSpeaking = true
+            defer {
+                if myGeneration == generation {
+                    isSpeaking = false
+                }
+            }
+            try await playAudio(url: cacheURL, generation: myGeneration)
+            return
         }
 
         print("🔊 TTS[GPT-SoVITS]: POST \(url.absoluteString) ref=\(refAudioPath)")
@@ -384,6 +460,20 @@ final class LocalGptSovitsService: TTSServiceProtocol {
         }
         guard !data.isEmpty else {
             throw TTSError.playbackError
+        }
+
+        // 动态 AI 内容不进缓存，避免无限增长；固定台词命中率才高。
+        if !isDynamic {
+            do {
+                try FileManager.default.createDirectory(
+                    at: Self.cacheDirectory,
+                    withIntermediateDirectories: true
+                )
+                try data.write(to: cacheURL, options: .atomic)
+                print("🔊 TTS cache saved: \(cacheURL.lastPathComponent)")
+            } catch {
+                print("⚠️ TTS cache write failed: \(error.localizedDescription)")
+            }
         }
 
         let tempURL = FileManager.default.temporaryDirectory
@@ -467,7 +557,7 @@ final class SystemTTSService: TTSServiceProtocol {
     /// 语音代次：旧 utterance 的 didFinish/didCancel/看门狗按代次丢弃
     private var generation = 0
 
-    func speak(_ text: String) async throws {
+    func speak(_ text: String, isDynamic: Bool = false) async throws {
         guard !text.isEmpty else { throw TTSError.invalidConfiguration }
         guard let voice = AVSpeechSynthesisVoice(language: "zh-CN") else {
             throw TTSError.invalidConfiguration

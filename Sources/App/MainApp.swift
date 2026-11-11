@@ -19,6 +19,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         
         // Initialize pet controller（必须在启动时初始化）
         petController = PetController.shared
+        petController.handleOfflineCompensation()
     }
     
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -26,6 +27,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
     
     func applicationWillTerminate(_ notification: Notification) {
+        petController?.saveLastOnlineTimestamp()
         PetState.shared.saveState()
         ConfigManager.shared.saveConfig()
     }

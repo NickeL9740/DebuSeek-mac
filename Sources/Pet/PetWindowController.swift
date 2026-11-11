@@ -30,8 +30,12 @@ final class PetWindow: NSWindow {
 
     /// 起拖阈值（pt）：小于此位移视为点击，不进入窗口拖拽
     private static let dragThreshold: CGFloat = 3
+    /// 长按取消阈值（pt）：3~8pt 的鼠标微抖仍算长按，不取消摸头
+    private static let longPressCancelThreshold: CGFloat = 8
 
     private var mouseDownScreenPoint: CGPoint?
+    /// 昏厥拖拽：按下时的窗口原点；只做窗口平移，不进入拖拽状态机。
+    private var faintedDragStartOrigin: CGPoint?
     private var mouseDownTimestamp: TimeInterval = 0
     private var isDraggingWindow = false
     /// 按下点是否命中鱼身像素（透明像素不启动窗口拖拽，也不派发点击）
@@ -58,6 +62,18 @@ final class PetWindow: NSWindow {
     override func sendEvent(_ event: NSEvent) {
         switch event.type {
         case .leftMouseDown:
+            // 精力归零：完全无法拖动/点击，先睡醒再说。
+            if PetState.shared.isFainted {
+                // 昏厥：不派发点击/长按，但记住按下点，允许用户把它挪个位置。
+                pressHitZone = .none
+                isLeftMouseDown = false
+                longPressFired = false
+                cancelLongPress()
+                mouseDownScreenPoint = convertPoint(toScreen: event.locationInWindow)
+                faintedDragStartOrigin = frame.origin
+                NSLog("😵 fainted: allow move, ignore click")
+                return
+            }
             let point = convertPoint(toScreen: event.locationInWindow)
             mouseDownScreenPoint = point
             mouseDownTimestamp = event.timestamp
@@ -72,11 +88,28 @@ final class PetWindow: NSWindow {
             handleLeftMouseDragged(event)
 
         case .leftMouseUp:
+            // 昏厥时只允许挪动位置，松开不派发点击/长按。
+            if PetState.shared.isFainted {
+                mouseDownScreenPoint = nil
+                faintedDragStartOrigin = nil
+                isLeftMouseDown = false
+                cancelLongPress()
+                return
+            }
             handleLeftMouseUp(event)
 
         case .rightMouseDown:
+            // 右键永远可用：昏厥/睡眠/空中都必须能弹菜单（投喂、重置、退出）。
+            // 不能因为 isFainted 直接 return，否则用户没有救活它的入口。
             let point = convertPoint(toScreen: event.locationInWindow)
-            let zone = hitZone(atScreenPoint: point)
+            var zone = hitZone(atScreenPoint: point)
+
+            // 像素 alpha 判定在睡眠/昏厥姿势下可能过严，右键放宽到整个宠物节点框：
+            // 只要点在鱼的绘制范围内，就按 body 处理，保证菜单一定弹出。
+            if zone == .none {
+                zone = coarseHitZone(atScreenPoint: point)
+            }
+
             if zone != .none {
                 dragController?.petScene.performRightClick(zone: zone)
             }
@@ -89,6 +122,29 @@ final class PetWindow: NSWindow {
     }
 
     private func handleLeftMouseDragged(_ event: NSEvent) {
+        // 昏厥：只允许被动位移，不进入拖拽状态机，也不重置动画/物理。
+        if PetState.shared.isFainted {
+            guard let window = dragController?.window else { return }
+            let currentPoint = convertPoint(toScreen: event.locationInWindow)
+
+            if let downPoint = mouseDownScreenPoint,
+               let startOrigin = faintedDragStartOrigin {
+                let origin = CGPoint(
+                    x: (startOrigin.x + currentPoint.x - downPoint.x).rounded(),
+                    y: (startOrigin.y + currentPoint.y - downPoint.y).rounded()
+                )
+                window.setFrameOrigin(origin)
+            } else {
+                // 拖拽途中才昏厥：从当前位置重新建立基准，下一次 dragged 开始跟随。
+                mouseDownScreenPoint = currentPoint
+                faintedDragStartOrigin = window.frame.origin
+            }
+            return
+        }
+
+        // 长按已经触发后，本次按住不再重新进入拖拽，避免 mouseUp 时状态卡在 dragging。
+        guard !longPressFired else { return }
+
         let currentPoint = convertPoint(toScreen: event.locationInWindow)
 
         // 兜底：应用处于非激活态时，系统可能吃掉第一次 mouseDown（点击只用于激活 App）。
@@ -100,15 +156,35 @@ final class PetWindow: NSWindow {
         // 只有按在鱼身像素上才允许拖拽窗口
         guard pressHitZone != .none else { return }
 
+        // 空中接住：不必等 3pt 阈值，第一次拖动就停止物理并切回拖拽。
+        if controller.state == .airborne {
+            if !isDraggingWindow {
+                isDraggingWindow = true
+                cancelLongPress()
+                controller.catchMidAir()
+                controller.startDrag(at: downPoint)
+                NSLog("🖱 Mouse Dragged → catch mid-air @ \(downPoint)")
+            }
+            controller.dragTo(currentPoint)
+            return
+        }
+
+        let dx = currentPoint.x - downPoint.x
+        let dy = currentPoint.y - downPoint.y
+        let distance = (dx * dx + dy * dy).squareRoot()
+
         if !isDraggingWindow {
-            let dx = currentPoint.x - downPoint.x
-            let dy = currentPoint.y - downPoint.y
-            guard (dx * dx + dy * dy).squareRoot() > Self.dragThreshold else { return }
+            guard distance > Self.dragThreshold else { return }
             isDraggingWindow = true
-            cancelLongPress()
-            isLeftMouseDown = false
+            // 3~8pt 只进入拖拽跟随，不取消长按；超过 8pt 才认定用户要拖走。
+            if distance > Self.longPressCancelThreshold {
+                cancelLongPress()
+            }
+            // 保持 isLeftMouseDown 为 true：长按计时器在 3~8pt 区间仍要能触发。
             controller.startDrag(at: downPoint)
             NSLog("🖱 Mouse Dragged → drag start @ \(downPoint)")
+        } else if distance > Self.longPressCancelThreshold {
+            cancelLongPress()
         }
 
         controller.dragTo(currentPoint)
@@ -118,6 +194,7 @@ final class PetWindow: NSWindow {
         let wasDragging = isDraggingWindow
         let didLongPress = longPressFired
         mouseDownScreenPoint = nil
+        faintedDragStartOrigin = nil
         isDraggingWindow = false
         isLeftMouseDown = false
         longPressFired = false
@@ -161,6 +238,7 @@ final class PetWindow: NSWindow {
     /// 窗口切换到穿透/隐藏时，清掉可能残留的拖拽跟踪状态
     func cancelMouseTracking() {
         mouseDownScreenPoint = nil
+        faintedDragStartOrigin = nil
         isDraggingWindow = false
         pressHitZone = .none
         isLeftMouseDown = false
@@ -188,13 +266,46 @@ final class PetWindow: NSWindow {
     }
 
     private func fireLongPress() {
-        guard isLeftMouseDown, !isDraggingWindow, pressHitZone != .none else { return }
-        guard let controller = dragController, controller.state == .resting else { return }
+        guard isLeftMouseDown, pressHitZone != .none else { return }
+        guard let controller = dragController else { return }
+        // 3~8pt 的微抖已经进入拖拽状态，但仍允许触发摸头。
+        guard controller.state == .resting || controller.state == .dragging else { return }
+
+        // 超过 8pt 后拖拽意图明确，长按不再生效（正常拖拽时工作项已被 cancel）。
+        if let downPoint = mouseDownScreenPoint {
+            let current = NSEvent.mouseLocation
+            let dx = current.x - downPoint.x
+            let dy = current.y - downPoint.y
+            guard (dx * dx + dy * dy).squareRoot() <= Self.longPressCancelThreshold else { return }
+        }
 
         longPressFired = true
+
+        // 长按在微拖状态下触发时，先结束这次拖拽，避免 mouseUp 后窗口停留在 dragging；
+        // 必须在 performLongPress 之前 endDrag，否则 onDragEnd 的 IDLE 会覆盖 HEAD_PAT。
+        if controller.state == .dragging {
+            controller.endDrag(velocity: .zero)
+            isDraggingWindow = false
+        }
+
         controller.petScene.suppressClicks(for: 0.6)
         controller.petScene.performLongPress(zone: pressHitZone)
         NSLog("🖱 long press zone=\(pressHitZone)")
+    }
+
+    /// 右键兜底：不做 alpha 判定，只要落在宠物节点的绘制框内就返回 body。
+    /// 昏厥/睡眠姿势的透明边缘较多，不能因此让右键菜单失效。
+    private func coarseHitZone(atScreenPoint screenPoint: CGPoint) -> HitZone {
+        guard let controller = dragController,
+              let window = controller.window,
+              let contentView = window.contentView else { return .none }
+
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let viewPoint = contentView.convert(windowPoint, from: nil)
+        let scenePoint = controller.petScene.convertPoint(fromView: viewPoint)
+
+        guard let petNode = controller.petScene.petNode else { return .none }
+        return petNode.frame.contains(scenePoint) ? .body : .none
     }
 
     /// 屏幕坐标处的像素命中分区（复用 PetScene 的 alpha 掩码判定）
@@ -241,6 +352,13 @@ final class PetWindowController: NSWindowController {
         static let heavyLandingSpeed: CGFloat = 120
         /// 静止时窗口底边离可见屏幕底部的距离（留出 dock 间隙）
         static let restHeight: CGFloat = 40
+        /// 自主跳跃基础向上速度（未疲劳）
+        static let selfJumpBaseHeight: CGFloat = 450
+        /// 自主跳跃基础水平速度（未疲劳）
+        static let selfJumpBaseDistance: CGFloat = 150
+        /// 3 万 Token 达到满疲劳
+        static let selfJumpFatigueTokens: Double = 30000
+
         /// 单帧最大积分步长，防跳帧穿墙
         static let maxTimeStep: CFTimeInterval = 1.0 / 30.0
         /// 撞墙/撞顶的防抖阈值：法向速度过小不重复触发 onWallBounce
@@ -259,6 +377,8 @@ final class PetWindowController: NSWindowController {
     var onDragEnd: ((CGVector) -> Void)?
     /// 落地，携带冲击速度（pt/s）。后续接线：>= 120 播 DIZZY，否则 LANDING。
     var onLanding: ((CGFloat) -> Void)?
+    /// 自主跳跃落地专用回调：不经过 onLanding，避免触发用户的 AI 互动回复。
+    var onSelfJumpLanding: ((CGFloat) -> Void)?
     /// 撞到左右屏幕边缘或顶部天花板。后续接线：播 POKE_REACT 一次。
     var onWallBounce: (() -> Void)?
 
@@ -266,6 +386,30 @@ final class PetWindowController: NSWindowController {
 
     private(set) var state: PetMotionState = .resting
     private(set) var velocity: CGVector = .zero
+
+    /// 本次拖拽是否是从空中「接住」开始的。
+    /// 接住后松手不再按采样速度抛掷，而是轻放（onSelfJumpLanding），避免刚抓住又飞出去。
+    private var isCaughtInAir = false
+    /// 最近一次拖拽松手速度；落地时用它计算抛掷高度奖励。
+    var lastReleaseVelocity: CGVector?
+    /// 本轮抛掷/自主跳跃是否撞过墙或天花板；落地回调用它决定扣/加心情。
+    private(set) var hitWallDuringJump = false
+
+    /// 本次飞行中窗口底边到达过的最高 y（绝对屏幕坐标）。
+    /// 与 flightStartY 相减得到真实飞行高度，避免把“窗口很高”误当成“飞得很高”。
+    private var maxHeightDuringFlight: CGFloat = 0
+    private var flightStartY: CGFloat = 0
+    /// 轻放只上报一次，避免落地反弹时重复触发 onLanding。
+    private var didReportSoftLanding = false
+    /// 本次抛掷的松手速度（供后续落地判定/调试）。
+    private var currentReleaseVelocity: CGVector = .zero
+
+    func clearWallHitFlag() {
+        hitWallDuringJump = false
+    }
+
+    /// 当前空中是否由自主跳跃触发；用于选择落地回调。
+    private var isSelfJumpAirborne = false
 
     /// 保留给像素命中测试（第二阶段）使用
     private(set) var petScene: PetScene
@@ -499,11 +643,30 @@ final class PetWindowController: NSWindowController {
     // MARK: - 拖拽（窗口级，不由 petNode 移动）
 
     /// 开始拖拽。`screenPoint` 为 AppKit 屏幕坐标（原点左下，`NSEvent.mouseLocation` 同系）。
+    /// 空中接住：停掉 CVDisplayLink，切回拖拽态，随后由调用方 startDrag。
+    func catchMidAir() {
+        guard state == .airborne else { return }
+        stopDisplayLink()
+        isSelfJumpAirborne = false
+        isCaughtInAir = true
+        state = .dragging
+        velocity = .zero
+        samples.removeAll(keepingCapacity: true)
+        NSLog("🧤 caught mid-air")
+    }
+
     func startDrag(at screenPoint: CGPoint) {
         guard let window = window else { return }
 
+        // 普通起拖清除接住标记；catchMidAir 已把 state 设为 .dragging，
+        // 这里不能把刚接住的标记清掉，否则松手会再次抛出去。
+        if state != .dragging {
+            isCaughtInAir = false
+        }
+
         // 从空中接管：先停帧驱动，避免与拖拽同时写 frame
         stopDisplayLink()
+        isSelfJumpAirborne = false
 
         state = .dragging
         velocity = .zero
@@ -539,25 +702,103 @@ final class PetWindowController: NSWindowController {
     func endDrag(velocity: CGVector? = nil) -> CGVector {
         guard state == .dragging else { return .zero }
 
-        let releaseVelocity = velocity ?? estimateVelocity()
-        self.velocity = releaseVelocity
+        // 空中接住后松手：强制静止 + 轻放，不按采样速度抛掷。
+        if isCaughtInAir {
+            isCaughtInAir = false
+            state = .resting
+            self.velocity = .zero
+            self.lastReleaseVelocity = .zero
+            currentReleaseVelocity = .zero
+            hitWallDuringJump = false
+            maxHeightDuringFlight = 0
+            flightStartY = 0
+            didReportSoftLanding = false
+            samples.removeAll(keepingCapacity: true)
+            onDragEnd?(.zero)
+            onSelfJumpLanding?(1)
+            NSLog("🧤 release caught pet → soft landing")
+            return .zero
+        }
 
-        let speed = (releaseVelocity.dx * releaseVelocity.dx + releaseVelocity.dy * releaseVelocity.dy).squareRoot()
-        if speed > Physics.throwSpeedMin {
+        let releaseVelocity = velocity ?? estimateVelocity()
+        isSelfJumpAirborne = false
+        hitWallDuringJump = false
+        didReportSoftLanding = false
+
+        // 只用松手速度决定是否抛掷；安全区不再在这里写死，
+        // 否则宠物在低处/贴地时会被永久判定为“不抛”，看起来像定在空中扔不出去。
+        let releaseSpeed = (releaseVelocity.dx * releaseVelocity.dx + releaseVelocity.dy * releaseVelocity.dy).squareRoot()
+        let didThrow = releaseSpeed > Physics.throwSpeedMin
+
+        if didThrow {
+            self.velocity = releaseVelocity
+            self.lastReleaseVelocity = releaseVelocity
+            currentReleaseVelocity = releaseVelocity
+            flightStartY = window?.frame.origin.y ?? 0
+            maxHeightDuringFlight = flightStartY
+
             // 抛掷：进入空中状态，启动 CVDisplayLink 积分循环
             state = .airborne
             lastTickTime = CACurrentMediaTime()
             startDisplayLink()
         } else {
-            // 慢速松手：不抛，直接静止（显示链路本来就没启动）
+            // 兜底：即使外部把 didThrow 置 false（安全区/接住等），也必须把
+            // displayLink、状态和速度全部清干净，绝不能让窗口悬停在空中。
+            stopDisplayLink()
             state = .resting
             self.velocity = .zero
+            self.lastReleaseVelocity = nil
+            currentReleaseVelocity = .zero
+            maxHeightDuringFlight = 0
+            flightStartY = 0
         }
 
         samples.removeAll(keepingCapacity: true)
-        onDragEnd?(releaseVelocity)
-
+        // 不抛掷时必须传零速度：否则 handleDragEnd 会按手速播 FALLING，
+        // 但物理状态已是 resting，会留下一个永远飞不完的动画。
+        onDragEnd?(didThrow ? releaseVelocity : .zero)
         return releaseVelocity
+    }
+
+    /// 让宠物从静止状态起跳，交给同一套 CVDisplayLink 重力/反弹积分。
+    /// 只允许 resting 起跳：拖拽或空中再次调用会被忽略，避免与现有 physics 抢 frame。
+    func launchJump(upwardVelocity: CGFloat, horizontalVelocity: CGFloat = 0) {
+        guard state == .resting else { return }
+
+        isSelfJumpAirborne = false
+        hitWallDuringJump = false
+        didReportSoftLanding = false
+        flightStartY = window?.frame.origin.y ?? 0
+        maxHeightDuringFlight = flightStartY
+        state = .airborne
+        velocity = CGVector(dx: horizontalVelocity, dy: upwardVelocity)
+        lastTickTime = CACurrentMediaTime()
+        startDisplayLink()
+    }
+
+    /// 自主跳跃：450/150 基础速度，按今日 Token 疲劳衰减，水平方向随机。
+    /// 落地走 onSelfJumpLanding，不触发 onLanding 的 AI 互动。
+    func launchSelfJump() {
+        guard state == .resting else { return }
+
+        let fatigue = min(1.0, Double(UsageManager.shared.todayTokens) / Physics.selfJumpFatigueTokens)
+        let vertical = Physics.selfJumpBaseHeight * CGFloat(1.0 - fatigue * 0.6)
+        let horizontal = Physics.selfJumpBaseDistance
+            * CGFloat(1.0 - fatigue * 0.7)
+            * CGFloat.random(in: 0.5...1.0)
+            * (Bool.random() ? 1 : -1)
+
+        isSelfJumpAirborne = true
+        hitWallDuringJump = false
+        didReportSoftLanding = false
+        flightStartY = window?.frame.origin.y ?? 0
+        maxHeightDuringFlight = flightStartY
+        state = .airborne
+        velocity = CGVector(dx: horizontal, dy: vertical)
+        lastTickTime = CACurrentMediaTime()
+        startDisplayLink()
+
+        NSLog("🦘 self jump v=(\(Int(horizontal)), \(Int(vertical))) fatigue=\(String(format: "%.2f", fatigue))")
     }
 
     // MARK: - 速度估计（最小二乘线性拟合）
@@ -656,6 +897,8 @@ final class PetWindowController: NSWindowController {
         lastTickTime = now
         guard dt > 0 else { return }
 
+        maxHeightDuringFlight = max(maxHeightDuringFlight, window.frame.origin.y)
+
         let size = window.frame.size
         let deltaTime = CGFloat(dt)
         var x = window.frame.origin.x + velocity.dx * deltaTime
@@ -674,12 +917,14 @@ final class PetWindowController: NSWindowController {
             x = screenFrame.minX
             let impact = abs(velocity.dx)
             velocity.dx = -velocity.dx * Physics.wallRestitution
+            hitWallDuringJump = true
             if impact > Physics.wallBounceMinSpeed { onWallBounce?() }
         }
         if x + size.width > screenFrame.maxX {
             x = screenFrame.maxX - size.width
             let impact = abs(velocity.dx)
             velocity.dx = -velocity.dx * Physics.wallRestitution
+            hitWallDuringJump = true
             if impact > Physics.wallBounceMinSpeed { onWallBounce?() }
         }
 
@@ -694,25 +939,47 @@ final class PetWindowController: NSWindowController {
             y = (screenTop - petTopFromBottom).rounded(.down)
             if velocity.dy > 0 {
                 velocity.dy = -velocity.dy * Physics.wallRestitution
-                print("💥 Hit ceiling!")
+                // 撞天花板与撞左右墙一样算一次碰撞：标记本轮撞墙并触发惩罚回调。
+                hitWallDuringJump = true
                 onWallBounce?()
+                print("💥 Hit ceiling!")
             }
         }
 
         // 地板反弹 + 静止判定
         if y <= floorY {
+            // 落地第一行先清掉本轮撞墙标记，避免下一次落地误读上一轮飞行。
+            hitWallDuringJump = false
             y = floorY
             let impact = abs(velocity.dy)
 
             velocity.dy = -velocity.dy * Physics.floorRestitution
 
-            if impact > Physics.settleSpeed {
-                onLanding?(impact)
-            }
-
-            if abs(velocity.dy) < Physics.settleSpeed {
+            // 先 settle 再回调：onLanding 里可能触发 AI 互动，
+            // skipAIWhileAirborne 会读 state；若仍是 airborne，落地这句会被误跳过。
+            let willSettle = abs(velocity.dy) < Physics.settleSpeed
+            if willSettle {
                 velocity.dy = 0
                 settle()
+            }
+
+            if willSettle && isSelfJumpAirborne {
+                isSelfJumpAirborne = false
+                // 自主跳跃即使冲击很小也要播 LANDING；绝不走 onLanding 的 AI 逻辑。
+                onSelfJumpLanding?(max(impact, 1))
+            } else if !isSelfJumpAirborne {
+                let flightHeight = maxHeightDuringFlight - flightStartY
+                let safeHeight = ConfigManager.shared.config.gameplay.floorSafeHeight
+                let isInSafeZone = window.frame.origin.y <= safeHeight
+                if flightHeight < 50 || isInSafeZone {
+                    // 极短飞行或仍在地板安全区内：传 -1 作为特殊低冲击值，Controller 不做奖惩。
+                    if !didReportSoftLanding {
+                        didReportSoftLanding = true
+                        onLanding?(-1)
+                    }
+                } else if impact > Physics.settleSpeed {
+                    onLanding?(impact)
+                }
             }
         }
 
