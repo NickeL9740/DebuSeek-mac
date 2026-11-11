@@ -27,6 +27,7 @@ class PetState: ObservableObject {
     @Published var position: CGPoint = CGPoint(x: 100, y: 100)
     @Published var isDragging: Bool = false
     @Published var lastInteraction: Date = Date()
+    @Published var wakeTargetEnergy: Int = 0
 
     // 行为树运行时状态（不持久化：旧 pet_state.json 缺这些键也不影响解码）
     @Published var boredom: Double = 0
@@ -61,6 +62,7 @@ class PetState: ObservableObject {
                 isSleeping = state.isSleeping
                 position = CGPoint(x: state.positionX, y: state.positionY)
                 lastInteraction = state.lastInteraction ?? Date()
+                wakeTargetEnergy = state.wakeTargetEnergy
                 print("✅ Pet state loaded")
             } catch {
                 print("❌ Failed to load pet state: \(error)")
@@ -79,7 +81,8 @@ class PetState: ObservableObject {
             isSleeping: isSleeping,
             positionX: position.x,
             positionY: position.y,
-            lastInteraction: lastInteraction
+            lastInteraction: lastInteraction,
+            wakeTargetEnergy: wakeTargetEnergy
         )
         do {
             let encoded = try encoder.encode(data)
@@ -101,6 +104,7 @@ class PetState: ObservableObject {
         currentActivity = .idle
         isAngry = false
         consecutivePokes = 0
+        wakeTargetEnergy = 0
         lastInteraction = Date()
         saveState()
     }
@@ -143,7 +147,8 @@ class PetState: ObservableObject {
     }
     
     /// 精力归零即昏厥：鼠标/聊天都会被拦截，只能睡觉恢复。
-    var isFainted: Bool { energy <= 0 }
+    /// wakeTargetEnergy > 0 表示正在强制恢复中，此时仍视为昏厥，防止精力刚回到 1 点就能被点击。
+    var isFainted: Bool { energy <= 0 || wakeTargetEnergy > 0 }
 
     var mood: PetMood {
         if isSleeping { return .sleeping }
@@ -167,6 +172,7 @@ struct PetStateData: Codable {
     var positionY: Double
     /// 旧 pet_state.json 没有这个字段；用可选值保证兼容。
     var lastInteraction: Date?
+    var wakeTargetEnergy: Int = 0
 }
 
 enum PetMood {

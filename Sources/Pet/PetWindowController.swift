@@ -765,7 +765,7 @@ final class PetWindowController: NSWindowController {
     func launchJump(upwardVelocity: CGFloat, horizontalVelocity: CGFloat = 0) {
         guard state == .resting else { return }
 
-        isSelfJumpAirborne = false
+        isSelfJumpAirborne = true
         hitWallDuringJump = false
         didReportSoftLanding = false
         flightStartY = window?.frame.origin.y ?? 0
@@ -970,9 +970,10 @@ final class PetWindowController: NSWindowController {
             } else if !isSelfJumpAirborne {
                 let flightHeight = maxHeightDuringFlight - flightStartY
                 let safeHeight = ConfigManager.shared.config.gameplay.floorSafeHeight
-                let isInSafeZone = window.frame.origin.y <= safeHeight
-                if flightHeight < 50 || isInSafeZone {
-                    // 极短飞行或仍在地板安全区内：传 -1 作为特殊低冲击值，Controller 不做奖惩。
+                let currentScreenMinY = window.screen?.visibleFrame.minY ?? 0
+                let isInSafeZone = window.frame.origin.y <= (currentScreenMinY + safeHeight)
+                if isInSafeZone && flightHeight < 50 {
+                    // 只有在安全区，且飞行高度极低时才免伤
                     if !didReportSoftLanding {
                         didReportSoftLanding = true
                         onLanding?(-1)

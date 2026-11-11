@@ -43,8 +43,6 @@ class PetController: NSObject, ObservableObject {
     // MARK: - Activity
     
     private var activityEndTick: Int = 0
-    /// 昏厥后强制睡到的精力目标（80~100）；0 表示普通睡眠。
-    private var wakeTargetEnergy: Int = 0
     /// 精力归零通知的观察者（PetState.updateEnergy 发布）
     private var energyDepletedObserver: NSObjectProtocol?
     private var walkDirection: CGFloat = 1
@@ -115,7 +113,7 @@ class PetController: NSObject, ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self = self, !PetState.shared.isSleeping else { return }
-                self.wakeTargetEnergy = Int.random(in: 80...100)
+                PetState.shared.wakeTargetEnergy = Int.random(in: 80...100)
                 self.startActivity(.sleep)
                 NSLog("😵 energy depleted → forced sleep triggered")
             }
@@ -360,7 +358,7 @@ class PetController: NSObject, ObservableObject {
             NSLog("😵 energy depleted → forced sleep")
             // 先定好强睡目标，避免通知观察者因 isSleeping 已置位而跳过设置，
             // 导致醒来条件退化成普通睡眠。
-            wakeTargetEnergy = Int.random(in: 80...100)
+            PetState.shared.wakeTargetEnergy = Int.random(in: 80...100)
             startActivity(.sleep)
         }
 
@@ -558,9 +556,9 @@ class PetController: NSObject, ObservableObject {
                 // 彻底锁死 activityEndTick 倒计时；只有 wakeTargetEnergy 达标才走 wakeUp()。
                 activityEndTick = Int.max
             }
-            if state.energy <= 0 && wakeTargetEnergy == 0 {
-                wakeTargetEnergy = Int.random(in: 80...100)
-                NSLog("😵 fainted sleep target=\(wakeTargetEnergy)")
+            if state.energy <= 0 && PetState.shared.wakeTargetEnergy == 0 {
+                PetState.shared.wakeTargetEnergy = Int.random(in: 80...100)
+                NSLog("😵 fainted sleep target=\(PetState.shared.wakeTargetEnergy)")
             }
 
             // 落地/拖拽回调可能把睡眠动画覆盖成 IDLE；只要仍在睡，就补回 SLEEPING，
@@ -574,15 +572,15 @@ class PetController: NSObject, ObservableObject {
                 state.updateEnergy(1)
             }
 
-            if wakeTargetEnergy > 0 {
-                if state.energy >= wakeTargetEnergy {
+            if PetState.shared.wakeTargetEnergy > 0 {
+                if state.energy >= PetState.shared.wakeTargetEnergy {
                     NSLog("😴 fainted sleep complete energy=\(state.energy)")
-                    wakeTargetEnergy = 0
+                    PetState.shared.wakeTargetEnergy = 0
                     wakeUp()
                 } else {
                     activityEndTick = max(activityEndTick, tick + 60)
                     if tick % 60 == 0 {
-                        NSLog("😴 fainted sleep continue energy=\(state.energy)/\(wakeTargetEnergy)")
+                        NSLog("😴 fainted sleep continue energy=\(state.energy)/\(PetState.shared.wakeTargetEnergy)")
                     }
                 }
             } else if state.energy < 20 {
@@ -704,7 +702,7 @@ class PetController: NSObject, ObservableObject {
     
     /// 设置页「重置宠物状态」唯一入口：重置状态、清掉强睡目标、强制回 IDLE。
     func resetPetState() {
-        wakeTargetEnergy = 0
+        PetState.shared.wakeTargetEnergy = 0
         stopWalkStep()
         PetState.shared.resetState()
         petScene.playAnimation("IDLE")
@@ -712,9 +710,10 @@ class PetController: NSObject, ObservableObject {
     }
 
     private func wakeUp() {
-        wakeTargetEnergy = 0
+        PetState.shared.wakeTargetEnergy = 0
         guard PetState.shared.isSleeping else { return }
         PetState.shared.isSleeping = false
+        PetState.shared.updateEnergy(max(1, PetState.shared.energy))
         PetState.shared.currentActivity = .idle
         petScene.playAnimationOnce("sleep_wake") { [weak self] in
             self?.petScene.playAnimation("IDLE")
@@ -722,8 +721,9 @@ class PetController: NSObject, ObservableObject {
     }
     
     private func interruptActivity() {
+        guard !PetState.shared.isFainted else { return }
         stopWalkStep()
-        wakeTargetEnergy = 0
+        PetState.shared.wakeTargetEnergy = 0
         let state = PetState.shared
         state.isSleeping = false
         state.currentActivity = .idle
@@ -911,7 +911,7 @@ class PetController: NSObject, ObservableObject {
         let state = PetState.shared
         guard state.energy >= energyCost,
               state.hunger + hungerCost <= 100 else {
-            NSLog("💔 gain happiness failed: energy=\(state.energy)/\(energyCost) hunger=\(state.hunger)/\(hungerCost)")
+            NSLog("💔 gain happiness failed: energy=\(state.energy) hunger=\(state.hunger)")
             return false
         }
         if energyCost > 0 { state.updateEnergy(-energyCost) }
@@ -1351,13 +1351,16 @@ class PetController: NSObject, ObservableObject {
 
         PetState.shared.updateLastInteraction()
         PetState.shared.updateHappiness(item.happiness)
-        PetState.shared.updateHunger(-item.satiety)
+        if item.satiety != 0 {
+            PetState.shared.updateHunger(-item.satiety)
+        }
         if item.energy != 0 {
             PetState.shared.updateEnergy(item.energy)
         }
         interruptActivity()
         let energyText = item.energy == 0 ? "" : "  精力 \(item.energy > 0 ? "+" : "")\(item.energy)"
-        petScene.showToast("饱腹度 +\(item.satiety)\(energyText)")
+        let satietyStr = item.satiety >= 0 ? "+\(item.satiety)" : "\(item.satiety)"
+        petScene.showToast("饱腹度 \(satietyStr)\(energyText)")
         playInteraction("EATING", line: item.lines.randomElement() ?? "好吃！")
         NSLog("🍤 feed \(item.name) price=\(price) remaining=\(UsageManager.shared.availableCurrency)")
     }
@@ -1732,6 +1735,11 @@ class PetController: NSObject, ObservableObject {
         case .popUpMenu: return .popUpMenu
         case .screenSaver: return .screenSaver
         }
+    }
+
+    deinit {
+        heartbeatTimer?.invalidate()
+        walkStepTimer?.invalidate()
     }
 }
 

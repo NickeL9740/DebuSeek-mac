@@ -1518,7 +1518,7 @@ struct FeedItemRow: View {
                     title: "饱腹度",
                     unit: "",
                     value: $satiety,
-                    range: 0...50,
+                    range: -50...50,
                     step: 1
                 )
                 .frame(maxWidth: 220)
@@ -1628,7 +1628,7 @@ struct AdvancedSettingsView: View {
                 HStack {
                     Text("版本")
                     Spacer()
-                    Text("0.1.0").foregroundColor(.secondary)
+                    Text("0.2.1").foregroundColor(.secondary)
                 }
                 HStack {
                     Text("作者")
